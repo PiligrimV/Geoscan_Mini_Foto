@@ -1,0 +1,133 @@
+## Для нормальноый работы необходимо установить следующие
+## !pip install --upgrade -q accelerate bitsandbytes
+## !pip install git+https://github.com/huggingface/transformers.git
+## !pip install datasets
+## !!Внимание!! иза отсуствия видеокарты в моем ноутбуке я использовал google colab
+
+from PIL import Image
+import torch
+import matplotlib.pyplot as plt
+from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration, CLIPProcessor, CLIPModel
+from datasets import load_dataset
+
+def extract_and_suggest_style(image: Image.Image) -> list[Image.Image]:
+    """
+    Определяет стиль одежды на фотографии человека и подбирает новый стиль.
+    Функция возвращает список изображений с похожими стилями одежды.
+    """
+    # Шаг 1: Генерация описания одежды на изображении
+    description = generate_clothing_description(image)
+    print('Detected clothing description: ', description)
+
+    # Шаг 2: Преобразование описания в список элементов одежды
+    clothing_items = parse_clothing_description(description)
+    print('Parsed clothing items: ', clothing_items)
+
+    # Шаг 3: Загрузка датасета одежды для поиска подходящих изображений
+    dataset = load_dataset("ghoumrassi/clothes_sample", cache_dir='./cache')['train']
+
+    # Инициализация модели CLIP для поиска соответствующих изображений стилей одежды
+    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+    clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+    # Шаг 4: Поиск наиболее похожих стилей для каждого элемента одежды
+    best_images = find_similar_clothing_images(clothing_items, dataset, clip_model, clip_processor)
+
+    print('Suggested clothing images found.')
+    return best_images
+
+
+def generate_clothing_prompt() -> str:
+    """
+    Создает текстовый промпт для визуально-языковой модели, чтобы описать одежду на фотографии.
+    """
+    return (
+       "Describe each clothing item in this image in detail. List them in a numbered list, specifying the type of clothing (e.g., shirt, trousers, shoes, accessories) and any distinctive features such as color, pattern, material, or unique style. include any additional information that clearly identifies each clothing item."
+    )
+
+def generate_clothing_description(image: Image.Image) -> str:
+    """
+    Генерирует описание стиля одежды на изображении с использованием визуально-языковой модели.
+    """
+    model_id = "llava-hf/llava-onevision-qwen2-0.5b-ov-hf"
+    model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+        model_id, torch_dtype=torch.float16, low_cpu_mem_usage=True
+    ).to(0)
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    prompt = [{"role": "user", "content": [{"type": "text", "text": generate_clothing_prompt()}, {"type": "image"}]}]
+    prompt = processor.apply_chat_template(prompt, add_generation_prompt=True)
+    inputs = processor(images=image, text=prompt, return_tensors="pt").to(0, torch.float16)
+
+    output = model.generate(**inputs, max_new_tokens=200, do_sample=False)
+    return processor.decode(output[0][2:], skip_special_tokens=True)
+
+
+def parse_clothing_description(description: str) -> list[str]:
+    """
+    Преобразует описание одежды в список предметов одежды.
+    """
+    items = description.split('assistant')[1].split('- ')[1:]
+    return [item.split('\n')[0] if '\n' in item else item for item in items]
+
+
+def find_similar_clothing_images(clothing_list: list[str], dataset, model, processor, batch_size=8) -> list[Image.Image]:
+    """
+    Ищет изображения из датасета, наиболее подходящие по стилю для каждого элемента одежды из списка.
+    """
+    best_matches = [None] * len(clothing_list)
+    best_probabilities = [0] * len(clothing_list)
+
+    for i in range(0, len(dataset), batch_size):
+        batch = [dataset[j]['image'] for j in range(i, min(i + batch_size, len(dataset)))]
+
+        inputs = processor(text=clothing_list, images=batch, return_tensors="pt", padding=True)
+        outputs = model(**inputs)
+        batch_probabilities = outputs.logits_per_image.softmax(dim=1).tolist()
+
+        # Проверка и обновление наилучших соответствий
+        for img_idx, probs in enumerate(batch_probabilities):
+            for item_idx, prob in enumerate(probs):
+                if prob > best_probabilities[item_idx]:
+                    best_probabilities[item_idx] = prob
+                    best_matches[item_idx] = batch[img_idx]
+
+    return best_matches
+
+def display_results(images: list[Image.Image], descriptions: list[str]):
+    """
+    Отображает изображения стилей с их описаниями.
+    """
+    plt.figure(figsize=(12, len(images) * 4))
+    for i, (img, desc) in enumerate(zip(images, descriptions)):
+        if img:
+            plt.subplot(len(images), 1, i + 1)
+            plt.imshow(img)
+            plt.axis("off")
+            plt.title(desc, fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+## Код для загрузки изображения в google colab
+
+from google.colab import files
+
+item = files.upload()
+
+## Ниже идет анализ и подбор стиля
+
+import requests
+
+# image_url = 'https://m.media-amazon.com/images/I/51Ys7FxOB-L._AC_UF1000,1000_QL80_.jpg'
+# image = Image.open(requests.get(image_url, stream=True, timeout=15).raw)
+image = Image.open("/content/123.jpg")
+
+# Шаг 1: Выполните анализ и подбор стилей
+suggested_styles = extract_and_suggest_style(image)
+
+# Шаг 2: Отобразите результаты
+if suggested_styles:
+    descriptions = [f"Style suggestion {i+1}" for i in range(len(suggested_styles))]
+    display_results(suggested_styles, descriptions)
+else:
+    print("No styles were suggested.")
